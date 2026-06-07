@@ -48,16 +48,16 @@ def parse_args():
     p.add_argument('--pullback-min', type=int, default=2, help='买点A: 最少回调天数')
     p.add_argument('--pullback-max', type=int, default=7, help='买点A: 最多回调天数')
     # 买点C核心参数
-    p.add_argument('--c-drop-pct', type=float, default=30.0, help='买点C: 从最高点回撤幅度%')
-    p.add_argument('--c-breakout-gain', type=float, default=4.0, help='买点C: 突破日最小涨幅%')
-    p.add_argument('--c-breakout-vol', type=float, default=1.5, help='买点C: 突破日最小量比')
+    p.add_argument('--c-drop-pct', type=float, default=25.0, help='买点C: 从最高点回撤幅度%')
+    p.add_argument('--c-breakout-gain', type=float, default=3.5, help='买点C: 突破日最小涨幅%')
+    p.add_argument('--c-breakout-vol', type=float, default=1.3, help='买点C: 突破日最小量比')
     p.add_argument('--c-vol-shrink', type=float, default=0.6, help='买点C: 回调日量/突破日量上限')
     p.add_argument('--c-body-pct', type=float, default=4.0, help='买点C: 今日K线最大实体%')
     p.add_argument('--c-pullback-max', type=int, default=5, help='买点C: 最多回调天数')
     # 买点C: 筑底参数
     p.add_argument('--c-base-days', type=int, default=20, help='买点C: 筑底观察天数')
-    p.add_argument('--c-avg-body-pct', type=float, default=4.0, help='买点C: 筑底期日均K线实体上限%')
-    p.add_argument('--c-base-vol-ratio', type=float, default=0.6, help='买点C: 筑底期均量/长周期均量上限')
+    p.add_argument('--c-avg-body-pct', type=float, default=5.0, help='买点C: 筑底期日均K线实体上限%')
+    p.add_argument('--c-base-vol-ratio', type=float, default=1.2, help='买点C: 筑底期均量/长周期均量上限')
     # 性能
     p.add_argument('--max-workers', type=int, default=20, help='并行线程数')
     p.add_argument('--hist-days', type=int, default=30, help='买点A: 获取K线天数')
