@@ -29,7 +29,9 @@ import argparse
 # ═══════════════════════════════════════════
 
 def parse_args():
-    p = argparse.ArgumentParser(description='买点A全市场扫描器')
+    p = argparse.ArgumentParser(description='买点A/C 右侧交易全市场扫描器')
+    # 模式
+    p.add_argument('--scan-mode', default='A', choices=['A', 'C'], help='扫描模式: A=突破回踩, C=底部首次突破')
     # 飞书配置
     p.add_argument('--feishu-sheet', default='', help='飞书表格ID（留空不写入）')
     p.add_argument('--feishu-token', default='~/.qclaw/skills-config/feishu/tokens/user_token.json',
@@ -39,15 +41,26 @@ def parse_args():
     p.add_argument('--min-cap', type=float, default=80.0, help='最小流通市值(亿)')
     p.add_argument('--max-cap', type=float, default=600.0, help='最大流通市值(亿)')
     # 买点A核心参数
-    p.add_argument('--breakout-gain', type=float, default=5.0, help='突破日最小涨幅%')
-    p.add_argument('--breakout-vol', type=float, default=1.5, help='突破日最小量比')
-    p.add_argument('--vol-shrink', type=float, default=0.55, help='今日量/突破日量上限')
-    p.add_argument('--body-pct', type=float, default=4.0, help='今日K线最大实体%')
-    p.add_argument('--pullback-min', type=int, default=2, help='最少回调天数')
-    p.add_argument('--pullback-max', type=int, default=7, help='最多回调天数')
+    p.add_argument('--breakout-gain', type=float, default=5.0, help='买点A: 突破日最小涨幅%')
+    p.add_argument('--breakout-vol', type=float, default=1.5, help='买点A: 突破日最小量比')
+    p.add_argument('--vol-shrink', type=float, default=0.55, help='买点A: 今日量/突破日量上限')
+    p.add_argument('--body-pct', type=float, default=4.0, help='买点A: 今日K线最大实体%')
+    p.add_argument('--pullback-min', type=int, default=2, help='买点A: 最少回调天数')
+    p.add_argument('--pullback-max', type=int, default=7, help='买点A: 最多回调天数')
+    # 买点C核心参数
+    p.add_argument('--c-drop-pct', type=float, default=30.0, help='买点C: 从最高点回撤幅度%')
+    p.add_argument('--c-breakout-gain', type=float, default=4.0, help='买点C: 突破日最小涨幅%')
+    p.add_argument('--c-breakout-vol', type=float, default=1.5, help='买点C: 突破日最小量比')
+    p.add_argument('--c-vol-shrink', type=float, default=0.6, help='买点C: 回调日量/突破日量上限')
+    p.add_argument('--c-body-pct', type=float, default=4.0, help='买点C: 今日K线最大实体%')
+    p.add_argument('--c-pullback-max', type=int, default=5, help='买点C: 最多回调天数')
+    # 买点C: 筑底参数
+    p.add_argument('--c-base-days', type=int, default=20, help='买点C: 筑底观察天数')
+    p.add_argument('--c-avg-body-pct', type=float, default=4.0, help='买点C: 筑底期日均K线实体上限%')
+    p.add_argument('--c-base-vol-ratio', type=float, default=0.6, help='买点C: 筑底期均量/长周期均量上限')
     # 性能
     p.add_argument('--max-workers', type=int, default=20, help='并行线程数')
-    p.add_argument('--hist-days', type=int, default=30, help='获取K线天数')
+    p.add_argument('--hist-days', type=int, default=30, help='买点A: 获取K线天数')
     return p.parse_args()
 
 
@@ -95,10 +108,10 @@ def get_market_cap(code, timeout=5):
 
 
 # ═══════════════════════════════════════════
-#  扫描核心
+#  扫描核心 - 买点A（突破回踩）
 # ═══════════════════════════════════════════
 
-def scan_stock(code, name, price, args):
+def scan_stock_a(code, name, price, args):
     """扫描单只股票，返回买点A匹配结果"""
     # 市值过滤
     if args.min_cap > 0 or args.max_cap < 9999:
@@ -202,6 +215,161 @@ def scan_stock(code, name, price, args):
 
 
 # ═══════════════════════════════════════════
+#  扫描核心 - 买点C（底部首次突破）
+# ═══════════════════════════════════════════
+
+def scan_stock_c(code, name, price, args):
+    """扫描单只股票，返回买点C匹配结果
+
+    三阶段: 下跌筑底 → 首次突破 → 回踩确认
+    """
+    # 市值过滤
+    if args.min_cap > 0 or args.max_cap < 9999:
+        cap = get_market_cap(code)
+        if cap < args.min_cap or cap > args.max_cap:
+            return None
+
+    # 买点C需要更多历史数据(150天)来判断下跌筑底
+    kline = get_kline(code, 150)
+    if not kline or len(kline) < 90:
+        return None
+
+    n = len(kline)
+    today = kline[-1]
+
+    # ── 阶段一: 下跌筑底 ──
+
+    # 1.1 从120日最高点回撤 >= 30%
+    peak_120 = max(k['close'] for k in kline[-120:])
+    current = today['close']
+    drawdown = (peak_120 - current) / peak_120 * 100
+    if drawdown < args.c_drop_pct:
+        return None
+
+    # 1.2 筑底期：近c_base_days天窄幅震荡
+    base = kline[-args.c_base_days:]
+    base_bodies = [abs(k['close'] - k['open']) / max(k['open'], 0.01) * 100 for k in base]
+    avg_body = sum(base_bodies) / len(base_bodies)
+    if avg_body > args.c_avg_body_pct:
+        return None
+
+    # 1.3 地量：筑底期均量 <= 60日均量 * c_base_vol_ratio
+    base_avg_vol = sum(k['volume'] for k in base) / len(base)
+    long_avg_vol = sum(k['volume'] for k in kline[-60:]) / 60
+    if long_avg_vol <= 0 or base_avg_vol / long_avg_vol > args.c_base_vol_ratio:
+        return None
+
+    # ── 阶段二: 搜索首次突破日 ──
+
+    breakout_day_idx = None
+    breakout_k = None
+
+    # 搜索最近30天内的突破事件
+    # 首次突破 = 放量站上20日线 + 此前k天在20日线下方
+    search_window = min(30, n - 2)
+    for i in range(n - 2, max(0, n - search_window - 1), -1):
+        bk = kline[i]
+        gain = (bk['close'] - bk['open']) / bk['open'] * 100
+
+        # 必须是阳线且涨幅达标
+        if bk['close'] <= bk['open'] or gain < args.c_breakout_gain:
+            continue
+
+        # 计算当时的20日均线
+        if i < 19:
+            continue
+        ma20_at_break = sum(kline[j]['close'] for j in range(i - 19, i + 1)) / 20
+
+        # 收盘站上20日线
+        if bk['close'] <= ma20_at_break:
+            continue
+
+        # 量比
+        vol_10 = sum(kline[j]['volume'] for j in range(i - 10, i)) / 9
+        if vol_10 <= 0 or bk['volume'] / vol_10 < args.c_breakout_vol:
+            continue
+
+        # 收盘在上半部（买盘强势）
+        body_center = (bk['open'] + bk['close']) / 2
+        if bk['close'] < body_center:
+            continue
+
+        # 首次突破确认：在此之前至少10天都在20日线下方
+        prev_below = True
+        for j in range(max(0, i - 15), i):
+            ma20_j = sum(kline[k_]['close'] for k_ in range(j - 19, j + 1)) / 20
+            if kline[j]['close'] > ma20_j:
+                prev_below = False
+                break
+
+        if not prev_below:
+            continue
+
+        breakout_day_idx = i
+        breakout_k = bk
+        break
+
+    if breakout_day_idx is None:
+        return None
+
+    # 突破日至今的天数
+    days_since_breakout = n - 1 - breakout_day_idx
+    if days_since_breakout < 1:
+        return None  # 突破当天，还没到回踩阶段
+
+    # ── 阶段三: 回踩确认 ──
+
+    # 回调不破20日线（允许盘中瞬间跌破但收盘收回）
+    ma20_today = sum(k['close'] for k in kline[-20:]) / 20
+    pb_lows = [k['low'] for k in kline[breakout_day_idx + 1:n]]
+
+    # 检查所有回调日的最低价
+    for j in range(breakout_day_idx + 1, n):
+        kj = kline[j]
+        ma20_j = sum(kline[k_]['close'] for k_ in range(j - 19, j + 1)) / 20
+        if kj['close'] < ma20_j and kj['low'] < ma20_j:
+            # 收盘跌破20日线 = 突破失败
+            return None
+
+    # 今天的情况
+    today_body = abs(today['close'] - today['open']) / max(today['open'], 0.01) * 100
+    today_vol = today['volume']
+
+    # 放量下跌 = 有问题
+    if today['close'] < today['open'] and today_vol > breakout_k['volume'] * 0.8:
+        return None
+
+    # 触发判断：缩量 + 小K线 + 不破20日线
+    vol_ok = today_vol <= breakout_k['volume'] * args.c_vol_shrink
+    body_ok = today_body <= args.c_body_pct
+    above_ma20 = today['close'] >= ma20_today or (
+        today['close'] < ma20_today and today['low'] < ma20_today and today['close'] > ma20_today * 0.99
+    )
+
+    mode = '买点C✅' if (vol_ok and body_ok and above_ma20) else '即将触发⏳'
+
+    return {
+        '代码': code, '名称': name,
+        '模式': mode,
+        '突破日': breakout_k['date'][5:],
+        '涨幅': f"{abs(breakout_k['close'] - breakout_k['open']) / breakout_k['open'] * 100:.1f}%",
+        '回调': f"{days_since_breakout}天",
+        '缩量比': f"{today_vol / breakout_k['volume']:.2f}",
+        'K线': f"{today_body:.1f}%",
+        '价': today['close'],
+        '方向': '↓' if today['close'] < today['open'] else '↑',
+        '回撤%': f"{drawdown:.0f}%",
+    }
+
+
+def scan_stock(code, name, price, args):
+    """根据scan_mode分流"""
+    if args.scan_mode == 'C':
+        return scan_stock_c(code, name, price, args)
+    return scan_stock_a(code, name, price, args)
+
+
+# ═══════════════════════════════════════════
 #  股票池
 # ═══════════════════════════════════════════
 
@@ -246,7 +414,11 @@ def write_feishu(hits, near, args):
         return
 
     today = datetime.now().strftime('%Y%m%d')
-    headers = ['代码', '名称', '突破日', '涨幅%', '回调天数', '缩量比', 'K线%', '现价', '状态']
+    is_c = len(hits) > 0 and hits[0].get('回撤%') is not None
+    if is_c:
+        headers = ['代码', '名称', '突破日', '涨幅%', '回调天数', '缩量比', 'K线%', '现价', '回撤%', '状态']
+    else:
+        headers = ['代码', '名称', '突破日', '涨幅%', '回调天数', '缩量比', 'K线%', '现价', '状态']
     sheet_token = args.feishu_sheet
 
     # 创建sheet
@@ -279,16 +451,30 @@ def write_feishu(hits, near, args):
         return code[2:] if code.startswith(('sh', 'sz')) else code
 
     rows = [headers]
-    for r_ in hits:
-        rows.append([clean(r_['代码']), r_['名称'], r_['突破日'],
-                      r_['涨幅'].replace('%', ''), r_['回调'].replace('天', ''),
-                      r_['缩量比'], r_['K线'].replace('%', ''), f"{r_['价']:.2f}", '触发'])
-    rows.append(['', '', '--- 即将触发 ---', '', '', '', '', '', ''])
-    rows.append(headers)
-    for r_ in near:
-        rows.append([clean(r_['代码']), r_['名称'], r_['突破日'],
-                      r_['涨幅'].replace('%', ''), r_['回调'].replace('天', ''),
-                      r_['缩量比'], r_['K线'].replace('%', ''), f"{r_['价']:.2f}", '即将触发'])
+    if is_c:
+        for r_ in hits:
+            rows.append([clean(r_['代码']), r_['名称'], r_['突破日'],
+                          r_['涨幅'].replace('%', ''), r_['回调'].replace('天', ''),
+                          r_['缩量比'], r_['K线'].replace('%', ''), f"{r_['价']:.2f}",
+                          r_['回撤%'].replace('%', ''), '触发'])
+        rows.append(['', '', '--- 即将触发 ---', '', '', '', '', '', '', ''])
+        rows.append(headers)
+        for r_ in near:
+            rows.append([clean(r_['代码']), r_['名称'], r_['突破日'],
+                          r_['涨幅'].replace('%', ''), r_['回调'].replace('天', ''),
+                          r_['缩量比'], r_['K线'].replace('%', ''), f"{r_['价']:.2f}",
+                          r_['回撤%'].replace('%', ''), '即将触发'])
+    else:
+        for r_ in hits:
+            rows.append([clean(r_['代码']), r_['名称'], r_['突破日'],
+                          r_['涨幅'].replace('%', ''), r_['回调'].replace('天', ''),
+                          r_['缩量比'], r_['K线'].replace('%', ''), f"{r_['价']:.2f}", '触发'])
+        rows.append(['', '', '--- 即将触发 ---', '', '', '', '', '', ''])
+        rows.append(headers)
+        for r_ in near:
+            rows.append([clean(r_['代码']), r_['名称'], r_['突破日'],
+                          r_['涨幅'].replace('%', ''), r_['回调'].replace('天', ''),
+                          r_['缩量比'], r_['K线'].replace('%', ''), f"{r_['价']:.2f}", '即将触发'])
 
     cols = len(headers)
     range_str = f"{new_sheet_id}!A1:{chr(64 + cols)}{len(rows)}"
@@ -310,17 +496,27 @@ def write_feishu(hits, near, args):
 def print_table(items, label):
     if not items:
         return
-    print(f"\n  {'代码':>7} {'名称':<7} {'突破日':<6} {'涨幅':<6} {'回调':<4} {'缩量比':<5} {'K线':<5} {'现价':<7} {'方向'}")
-    print(f"  {'─'*48}")
-    for r in sorted(items, key=lambda x: x['回调'], reverse=True):
-        print(f"  {r['代码']:>7} {r['名称']:<7} {r['突破日']:<6} {r['涨幅']:<6} {r['回调']:<4} {r['缩量比']:<5} {r['K线']:<5} {r['价']:<7.2f} {r['方向']}")
+    is_c = items[0].get('回撤%') is not None
+    if is_c:
+        print(f"\n  {'代码':>7} {'名称':<7} {'突破日':<6} {'涨幅':<6} {'回调':<4} {'缩量比':<5} {'K线':<5} {'现价':<7} {'回撤':<5} {'方向'}")
+        print(f"  {'─'*57}")
+        for r in sorted(items, key=lambda x: float(x['回撤%'].replace('%', '')), reverse=True):
+            print(f"  {r['代码']:>7} {r['名称']:<7} {r['突破日']:<6} {r['涨幅']:<6} {r['回调']:<4} {r['缩量比']:<5} {r['K线']:<5} {r['价']:<7.2f} {r['回撤%']:<5} {r['方向']}")
+    else:
+        print(f"\n  {'代码':>7} {'名称':<7} {'突破日':<6} {'涨幅':<6} {'回调':<4} {'缩量比':<5} {'K线':<5} {'现价':<7} {'方向'}")
+        print(f"  {'─'*48}")
+        for r in sorted(items, key=lambda x: x['回调'], reverse=True):
+            print(f"  {r['代码']:>7} {r['名称']:<7} {r['突破日']:<6} {r['涨幅']:<6} {r['回调']:<4} {r['缩量比']:<5} {r['K线']:<5} {r['价']:<7.2f} {r['方向']}")
 
 
 def main():
     args = parse_args()
 
+    is_c = args.scan_mode == 'C'
+    mode_name = '买点C' if is_c else '买点A'
+
     print("═" * 52)
-    print(f"  买点A扫描器 | {datetime.now().strftime('%m-%d %H:%M')}")
+    print(f"  {mode_name}扫描器 | {datetime.now().strftime('%m-%d %H:%M')}")
     print(f"  市值{args.min_cap}-{args.max_cap}亿 | {args.max_workers}线程")
     print("═" * 52)
 
@@ -340,25 +536,33 @@ def main():
                       end="\r" if done < len(pool) else "\n")
             try:
                 r = f.result()
-                if r and r['模式'] == '买点A✅':
-                    hits.append(r)
-                elif r and r['模式'] == '即将触发⏳':
-                    near.append(r)
+                if r:
+                    if r['模式'] in (f'{mode_name}✅', '买点A✅', '买点C✅'):
+                        hits.append(r)
+                    elif r['模式'] == '即将触发⏳':
+                        near.append(r)
             except:
                 pass
 
     print(f"\n扫描完成: {time.time() - t_start:.0f}s")
     print(f"\n{'─'*52}")
-    print(f"  ✅ 买点A触发: {len(hits)} 只（今日可买入）")
+    print(f"  ✅ {mode_name}触发: {len(hits)} 只（今日可买入）")
     print(f"  ⏳ 即将触发: {len(near)} 只（观察1-2天）")
     print(f"{'─'*52}")
 
     print_table(hits, '触发')
     if hits:
-        print(f"\n  → 尾盘买入50% | 止损=突破日阳线实体最低-3%")
+        if is_c:
+            print(f"\n  → 尾盘买入50% | 止损=突破日最低价-3%")
+            print(f"  → 止盈: 第一目标+20%, 第二目标+30~+50%")
+        else:
+            print(f"\n  → 尾盘买入50% | 止损=突破日阳线实体最低-3%")
     if near:
         print_table(near, '即将触发')
-        print(f"\n  → 加自选观察，等明日缩量+小K线再确认")
+        if is_c:
+            print(f"\n  → 加自选，等缩量+小K线+不破20日线再确认")
+        else:
+            print(f"\n  → 加自选观察，等明日缩量+小K线再确认")
     if not hits and not near:
         print(f"\n  (今日无符合条件标的)")
     print(f"\n{'─'*52}")
