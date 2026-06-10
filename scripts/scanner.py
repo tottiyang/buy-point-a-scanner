@@ -140,10 +140,6 @@ def scan_stock_a(code, name, price, args):
     today_body = abs(t['close'] - t['open']) / max(t['open'], 0.01) * 100
     today_vol = t['volume']
 
-    avg_v = sum(k['volume'] for k in kline[-11:-1]) / 9
-    if avg_v <= 0:
-        return None
-
     # 20日线方向
     ma20 = sum(k['close'] for k in kline[-20:]) / 20
     ma20_p = sum(k['close'] for k in kline[-21:-1]) / 20
@@ -155,7 +151,12 @@ def scan_stock_a(code, name, price, args):
     for i in range(n - 2, max(-1, n - args.pullback_max - 2), -1):
         bk = kline[i]
         gain = (bk['close'] - bk['open']) / bk['open'] * 100
-        vr = bk['volume'] / avg_v
+
+        # 量比基准：突破日之前10天（不含突破日本身），避免事后污染
+        avg_v_pre = sum(kline[j]['volume'] for j in range(max(0, i - 10), i)) / min(10, i)
+        if avg_v_pre <= 0:
+            continue
+        vr = bk['volume'] / avg_v_pre
 
         if gain < args.breakout_gain or vr < args.breakout_vol:
             continue
@@ -192,7 +193,12 @@ def scan_stock_a(code, name, price, args):
     for i in range(n - 3, max(-1, n - args.pullback_max - 3), -1):
         bk = kline[i]
         gain = (bk['close'] - bk['open']) / bk['open'] * 100
-        vr = bk['volume'] / avg_v
+
+        # 量比基准：突破日之前10天（不含突破日本身）
+        avg_v_pre = sum(kline[j]['volume'] for j in range(max(0, i - 10), i)) / min(10, i)
+        if avg_v_pre <= 0:
+            continue
+        vr = bk['volume'] / avg_v_pre
 
         if gain < args.breakout_gain or vr < args.breakout_vol:
             continue
