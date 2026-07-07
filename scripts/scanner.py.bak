@@ -23,7 +23,6 @@ import time
 import os
 import json
 import argparse
-import uuid
 
 # ═══════════════════════════════════════════
 #  解析参数
@@ -32,7 +31,7 @@ import uuid
 def parse_args():
     p = argparse.ArgumentParser(description='买点A/B/C/D 右侧交易全市场扫描器 (B=洗盘反转/破底翻)')
     # 模式
-    p.add_argument('--scan-mode', default='A', choices=['A', 'B', 'C', 'D', 'X'], help='扫描模式: A=突破回踩, B=洗盘反转, C=底部首次突破, D=卖压衰竭(缩量预警), X=净流入滞涨(净特大>净大单>0,涨幅2%~5%,换手率>5%,量比>1.3)')
+    p.add_argument('--scan-mode', default='A', choices=['A', 'B', 'C', 'D'], help='扫描模式: A=突破回踩, B=洗盘反转, C=底部首次突破, D=卖压衰竭(缩量预警)')
     # 飞书配置
     p.add_argument('--feishu-sheet', default='', help='飞书表格ID（留空则从config.json自动读取）')
     p.add_argument('--feishu-token', default='~/.qclaw/skills-config/feishu/tokens/user_token.json',
@@ -60,14 +59,11 @@ def parse_args():
     p.add_argument('--c-avg-body-pct', type=float, default=5.0, help='买点C: 筑底期日均K线实体上限%')
     p.add_argument('--c-base-vol-ratio', type=float, default=1.2, help='买点C: 筑底期均量/长周期均量上限')
     # 买点D核心参数（卖压衰竭预警）
-    p.add_argument('--d-trend', type=str, default='ma20ma55', choices=['ma20','ma20ma55'], help='买点D: 趋势基准 ma20=MA20向上 ma20ma55=MA20>MA55金叉')
+    p.add_argument('--d-trend', type=str, default='ma20ma60', choices=['ma20','ma20ma60'], help='买点D: 趋势基准 ma20=MA20向上 ma20ma60=MA20>MA55金叉')
     p.add_argument('--d-drop-pct', type=float, default=8.0, help='买点D: 从20日高点最小回撤%')
     p.add_argument('--d-vol-ratio20max', type=float, default=0.50, help='买点D: 今日量/20日最高量上限')
     p.add_argument('--d-body-pct', type=float, default=4.0, help='买点D: K线最大实体%')
-    p.add_argument('--d-close-above-ma55', action='store_true', default=True, help='买点D: 收盘在MA55上方')
-    # 买点X核心参数（净特大滞涨）
-    p.add_argument('--x-ratio-min', type=float, default=1.5, help='买点X: 净特大/净大单最小比值(排除1~1.5模糊区)')
-    p.add_argument('--x-ratio-max', type=float, default=3.0, help='买点X: 净特大/净大单最大比值(排除>3追高入场)')
+    p.add_argument('--d-close-above-ma60', action='store_true', default=True, help='买点D: 收盘在MA55上方')
     # 买点B核心参数（洗盘反转/破底翻）
     p.add_argument('--e-drop-pct', type=float, default=10.0, help='买点B: 从高点最小回撤%')
     p.add_argument('--e-vol-up-gain', type=float, default=5.0, help='买点B: 放量上涨日最小涨幅%')
@@ -77,6 +73,7 @@ def parse_args():
     p.add_argument('--e-lookback', type=int, default=15, help='买点B: 搜索缩量日的最大回看天数')
     p.add_argument('--e-cumul-vol-ratio', type=float, default=1.2, help='买点B: 3日累计放量备选-累计量/10日均量×3的下限')
     p.add_argument('--e-cumul-gain', type=float, default=8.0, help='买点B: 3日累计放量备选-3日累计涨幅下限%%')
+    p.add_argument('--e-gap-threshold', type=float, default=1.5, help='买点B: 跳空缺口替补-最小跳空%%(开盘-前收盘)/前收盘')
     # 性能
     p.add_argument('--max-workers', type=int, default=20, help='并行线程数')
     p.add_argument('--hist-days', type=int, default=30, help='买点A: 获取K线天数')
@@ -115,10 +112,8 @@ def get_kline(code, days=30):
 
 
 def get_market_cap(code, timeout=5):
-    """获取流通市值（亿）"""
     try:
-        gid = to_gid(code)
-        r = requests.get(f'http://qt.gtimg.cn/q={gid}',
+        r = requests.get(f'http://qt.gtimg.cn/q={code}',
                          timeout=timeout, headers={'User-Agent': 'Mozilla/5.0'})
         parts = r.text.split('~')
         if len(parts) > 46:
@@ -126,62 +121,6 @@ def get_market_cap(code, timeout=5):
     except:
         pass
     return 0
-
-
-def get_turnover_rate(code, timeout=5):
-    """获取腾讯API换手率（%），qt.gtimg.cn 字段38
-    盘中自动按交易时间缩放估算全天换手率
-    """
-    try:
-        gid = to_gid(code)
-        r = requests.get(f'http://qt.gtimg.cn/q={gid}',
-                         timeout=timeout, headers={'User-Agent': 'Mozilla/5.0'})
-        parts = r.text.split('~')
-        if len(parts) > 38:
-            rate = float(parts[38])
-            # 盘中按已交易时间比例缩放
-            now = datetime.now()
-            cur_min = now.hour * 60 + now.minute
-            market_open = 9 * 60 + 30
-            market_close = 15 * 60
-            if now.weekday() < 5 and market_open <= cur_min <= market_close:
-                passed_w = _calc_passed_weight()
-                if 0 < passed_w < 1.0:
-                    rate = rate / passed_w
-            return rate
-    except:
-        pass
-    return 0
-
-
-def get_eastmoney_secid(code):
-    """Convert stock code to East Money secid format"""
-    s = str(code).strip()
-    s = s.replace('sh', '').replace('sz', '').replace('bj', '').zfill(6)
-    return f"1.{s}" if s.startswith(('6', '9')) else f"0.{s}"
-
-
-def get_money_flow_b(code):
-    """获取东方财富大单/特大单(超大单)当日资金流向
-
-    Returns:
-        (big_net, super_big_net)  大单净流入, 超大单净流入（万元）
-        None if failed
-    """
-    try:
-        secid = get_eastmoney_secid(code)
-        url = f'http://push2.eastmoney.com/api/qt/stock/fflow/daykline/get?secid={secid}&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65'
-        r = requests.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
-        data = r.json()
-        if data.get('data'):
-            klines = data['data'].get('klines', [])
-            if klines:
-                parts = klines[-1].split(',')
-                # [0]date [1]主力净 [2]小单 [3]中单 [4]大单 [5]超大单 [6-8]占比...
-                return (float(parts[4]), float(parts[5]))
-    except:
-        pass
-    return None
 
 
 def _calc_macd(kline):
@@ -342,11 +281,8 @@ def scan_stock_b(code, name, price, args):
     - 反包对比缩量日的量
     - 盘中模式：从腾讯实时行情取数据，量能预估
     """
-    # 获取流通市值（用于市值过滤）和总市值（用于换手率计算）
-    cap = get_market_cap(code)
-    if cap <= 0:
-        return None
     if args.min_cap > 0 or args.max_cap < 9999:
+        cap = get_market_cap(code)
         if cap < args.min_cap or cap > args.max_cap:
             return None
 
@@ -426,8 +362,6 @@ def scan_stock_b(code, name, price, args):
     shrink_day_idx = None
     vol_up_day = None
     vol_up_day_vol = None
-    near_miss_shrink = False  # 缩量比在55%~60%(或累计44%~48%)放宽区间
-    near_miss_shrink_max = None  # 记录该区间的实际缩量比上限
 
     # 从最新日期往前，找第一个满足条件的缩量日+它之前的放量上涨日对
     for j in range(n - 2, max(0, n - args.e_lookback - 1), -1):
@@ -521,13 +455,7 @@ def scan_stock_b(code, name, price, args):
         if is_cumul_anchor:
             shrink_threshold *= 0.8  # 累计放量锚点收紧缩量比（0.55→0.44）
         if kj['volume'] > cand_vol_up_vol * shrink_threshold:
-            # 缩量55%~60%也列入即将触发列表（始终基于原始0.55阈值，不受累计锚点收严影响）
-            base_near_miss = cand_vol_up_vol * args.e_vol_shrink_ratio * 1.09
-            if kj['volume'] <= base_near_miss:
-                near_miss_shrink = True
-                near_miss_shrink_max = base_near_miss
-            else:
-                continue
+            continue
 
         # 缩量日当天收盘相对前日涨幅≤1%（下跌或平盘，排除跳空涨停/大涨）
         if j > 0:
@@ -548,32 +476,34 @@ def scan_stock_b(code, name, price, args):
     if shrink_day is None or vol_up_day is None:
         return None
 
-    # ── 阶段三: 反包日确认 ──
+    # ── 阶段三: 反包日确认（今天必须是反包日） ──
 
     # 实际涨幅（基于前收盘，非开盘价）
     gain_today = (today_close - yesterday_close) / yesterday_close * 100
 
-    # 收集阶段三失败项（近缩量票不封死，记入不满足项）
-    phase3_fails = []
-
     # 阳线（收盘 > 前收盘即视为上涨）
     if today_close <= yesterday_close:
-        phase3_fails.append('非阳线')
+        return None
 
     # 双因子反包：收盘≥前日最高，或(今高≥前日最高 AND 今收>昨开=阳吃阴)
     if not (today_close >= yesterday['high'] or (today_high >= yesterday['high'] and today_close > yesterday['open'])):
-        phase3_fails.append('未反包')
+        return None
 
     # 放量检测：今日量 ≥ 缩量日量 × 阈值（盘中用预估量）
     # 缺口替补：量不足但真实缺口同样认可（缺口=买方紧迫性，幅度不限）
     if today_vol < shrink_day['volume'] * args.e_reversal_vol_ratio:
         real_gap = today_low > yesterday['high']
         if not real_gap:
-            phase3_fails.append('放量不足')
+            return None
 
     # MACD双因子：柱翻转(柱>前日) 或 DIF>DEA(柱>0，多头趋势未破坏)
     if len(macd) >= 2 and not (macd[-1] > macd[-2] or macd[-1] > 0):
-        phase3_fails.append('MACD')
+        return None
+
+    # 站上5日线（不再作为必要条件，仅观察参考）
+    # ma5 = sum(k['close'] for k in kline[-5:]) / 5
+    # if today_close < ma5:
+    #     return None
 
     # 反包日量 > 10日均量 × 0.8（盘中用预估量）
     # 缺口替补：量不足但真实缺口同样通过
@@ -581,68 +511,16 @@ def scan_stock_b(code, name, price, args):
     if today_vol < avg_10d_vol * 0.8:
         real_gap = today_low > yesterday['high']
         if not real_gap:
-            phase3_fails.append('均量不足')
+            return None
 
     # 缩量日距今不超过2天（洗盘-反包间隔不宜过长）
     if n - 1 - shrink_day_idx > 2:
-        phase3_fails.append('缩距过长')
+        return None
 
     # ── 过滤：当日最高不创10日新高（卖压衰竭特征，非强势突破） ──
     max_high_10d_back = max(k['high'] for k in kline[-11:-1])  # 不含今日的近10天
     if today_high > max_high_10d_back:
-        phase3_fails.append('创新高')
-
-    # 非近缩量票：阶段三有任一失败即淘汰
-    if not near_miss_shrink and phase3_fails:
         return None
-    # 近缩量票：阶段三可以失败，记入不满足项继续输出
-
-    # ── 三项检查: 资金净流入 / 量>前5日均量 / 换手率>10% ──
-    # 均净流出→淘汰；任一不满足→即将触发⏳；全满足→买点B✅
-
-    # ① 资金净流入
-    money_flow = get_money_flow_b(code)
-    if money_flow is not None:
-        big_net, super_big_net = money_flow
-        if big_net <= 0 and super_big_net <= 0:
-            if not near_miss_shrink:
-                return None  # 非近缩量票：均净流出淘汰
-            phase3_fails.append('资金双流')  # 近缩量票：记入不满足
-            fund_ok = False
-        else:
-            fund_ok = big_net > 0 and super_big_net > 0
-    else:
-        fund_ok = True  # 接口超时放行
-
-    # ② 量 > 前5日均量
-    avg_vol_5d = sum(k['volume'] for k in kline[-6:-1]) / 5
-    vol_ok = today_vol > avg_vol_5d
-
-    # ③ 换手率 > 10% (qt.gtimg.cn字段38)
-    turnover_rate = get_turnover_rate(code)
-    if turnover_rate > 0:
-        turnover_ok = turnover_rate > 10
-    else:
-        turnover_ok = True  # 接口超时放行
-
-    # 收集不满足项
-    fail_reasons = []
-    if near_miss_shrink:
-        fail_reasons.append('缩量比偏大')
-    fail_reasons.extend(phase3_fails)
-    if money_flow is not None and not fund_ok:
-        fail_reasons.append('资金')
-    if not vol_ok:
-        fail_reasons.append('量不足')
-    if turnover_rate > 0 and not turnover_ok:
-        fail_reasons.append('换手')
-
-    if near_miss_shrink:
-        mode_tag = '即将触发⏳'  # 缩量比接近阈值，归入触发列表
-    elif not phase3_fails and fund_ok and vol_ok and turnover_ok:
-        mode_tag = '买点B✅'
-    else:
-        mode_tag = '即将触发⏳'
 
     # ── 输出 ──
     today_body = abs(today_close - today_open) / today_open * 100
@@ -652,7 +530,7 @@ def scan_stock_b(code, name, price, args):
 
     return {
         '代码': code, '名称': name,
-        '模式': mode_tag,
+        '模式': '买点B✅',
         '今涨%': f"{gain_today:.1f}%",
         '放量比': f"{reversal_ratio:.2f}",
         '缩量日': shrink_day['date'][5:],
@@ -661,7 +539,6 @@ def scan_stock_b(code, name, price, args):
         '放量日': vol_up_day['date'][5:],
         '价': today_close,
         'K线': f"{today_body:.1f}%",
-        '不满足': ','.join(fail_reasons),
     }
 
 
@@ -875,8 +752,7 @@ def _calc_passed_weight(now=None):
 def get_realtime_tencent(code):
     """获取腾讯实时行情（含成交量、资金净流入）"""
     try:
-        gid = to_gid(code)
-        r = requests.get(f'http://qt.gtimg.cn/q={gid}',
+        r = requests.get(f'http://qt.gtimg.cn/q={code}',
                         timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
         parts = r.text.split('~')
         if len(parts) > 46:
@@ -888,10 +764,121 @@ def get_realtime_tencent(code):
                 'prev_close': float(parts[4]),
                 'vol': float(parts[36]),  # 成交量（手）
                 'amount': float(parts[37]) * 10000,  # 成交额（元）
+                'main_net': float(parts[43]) if len(parts) > 43 else 0,  # 主力净流入（万元）
             }
     except:
         pass
     return None
+
+
+def scan_stock_d_intraday(code, name, price, args):
+    """买点D: 盘中模式（实时量比推算）"""
+    if args.min_cap > 0 or args.max_cap < 9999:
+        cap = get_market_cap(code)
+        if cap < args.min_cap or cap > args.max_cap:
+            return None
+
+    # 获取日K线（历史数据）
+    kline = get_kline(code, 60)
+    if not kline or len(kline) < 30:
+        return None
+
+    n = len(kline)
+    today = kline[-1]
+
+    # 获取实时数据
+    rt = get_realtime_tencent(code)
+    if not rt:
+        return None
+
+    today_close = rt['price']
+    today_open = rt['open']
+    today_high = rt['high']
+    today_low = rt['low']
+    today_vol = rt['vol']  # 当前累计成交量
+    main_net = rt['main_net']  # 主力净流入（万元）
+
+    # ── 阶段一: 趋势确认 ──
+    ma5 = sum(k['close'] for k in kline[-5:]) / 5
+    ma10 = sum(k['close'] for k in kline[-10:]) / 10
+    ma20 = sum(k['close'] for k in kline[-20:]) / 20
+
+    if args.d_ma5_above_ma10 and ma5 <= ma10:
+        return None
+    if args.d_ma10_above_ma20 and ma10 <= ma20:
+        return None
+    if args.d_price_above_ma5 and today_close <= ma5:
+        return None
+
+    # ── 阶段二: 回调发生 ──
+    pullback_days = 0
+    for j in range(n - 2, max(0, n - args.d_pullback_max - 2), -1):
+        if kline[j]['close'] < kline[j + 1]['close']:
+            pullback_days += 1
+        else:
+            break
+
+    if pullback_days < 1 or pullback_days > args.d_pullback_max:
+        return None
+
+    vol_5_avg = sum(k['volume'] for k in kline[-5:]) / 5
+    for j in range(n - pullback_days - 1, n - 1):
+        if kline[j]['volume'] >= vol_5_avg * args.d_vol_shrink:
+            return None
+
+    for j in range(n - pullback_days - 1, n):
+        kj = kline[j]
+        ma10_j = sum(kline[k_]['close'] for k_ in range(j - 9, j + 1)) / 10
+        if kj['low'] < ma10_j * (1 + args.d_ma10_support / 100):
+            return None
+
+    # ── 阶段三: 重启信号 ──
+    if today_close <= today_open:
+        return None
+
+    gain_today_intra = (today_close - today_open) / today_open * 100
+    # 实际涨跌幅（基于前收盘）
+    prev_close_d = kline[-2]['close']
+    gain_today = (today_close - prev_close_d) / prev_close_d * 100
+    if gain_today < args.d_gain_min:
+        return None
+
+    yesterday_high = kline[-2]['high']
+    if args.d_break_prev_high and today_close <= yesterday_high:
+        return None
+
+    # 盘中量比推算
+    yesterday_vol = kline[-2]['volume']
+    passed_w = _calc_passed_weight()
+    if passed_w >= 0.05:
+        estimated_full = today_vol / passed_w
+        vol_ratio = estimated_full / yesterday_vol if yesterday_vol > 0 else 0
+    else:
+        vol_ratio = today_vol / yesterday_vol if yesterday_vol > 0 else 0
+
+    if vol_ratio < args.d_vol_ratio_min:
+        return None
+
+    # 资金净流入
+    if args.d_fund_inflow and main_net <= 0:
+        return None
+
+    today_body = abs(today_close - today_open) / today_open * 100
+
+    return {
+        '代码': code, '名称': name,
+        '模式': '买点D✅',
+        '突破日': '-',
+        '涨幅': f"{gain_today:.1f}%",
+        '回调': f"{pullback_days}天",
+        '缩量比': f"{vol_ratio:.2f}",
+        'K线': f"{today_body:.1f}%",
+        '价': today_close,
+        '方向': '↑',
+        'MA20距离': f"{(today_close - ma20) / ma20 * 100:.1f}%",
+        '量比': f"{vol_ratio:.2f}",
+        '资金': f"{main_net:.0f}万",
+    }
 
 
 def scan_stock_d(code, name, price, args):
@@ -937,12 +924,12 @@ def scan_stock_d(code, name, price, args):
     # ── 条件一: 趋势在 ──
     ma20 = sum(k['close'] for k in kline[-20:]) / 20
     ma20_p = sum(k['close'] for k in kline[-21:-1]) / 20
-    ma55 = sum(k['close'] for k in kline[-55:]) / 55
+    ma60 = sum(k['close'] for k in kline[-60:]) / 60
 
     if args.d_trend == 'ma20':
         trend_ok = ma20 > ma20_p
-    else:  # ma20ma55
-        trend_ok = ma20 > ma55
+    else:  # ma20ma60
+        trend_ok = ma20 > ma60
 
     if not trend_ok:
         return None
@@ -972,7 +959,7 @@ def scan_stock_d(code, name, price, args):
         return None
 
     # ── 条件六（可选）: 仍在MA55上方（长线趋势未破） ──
-    if args.d_close_above_ma55 and today_close < ma55:
+    if args.d_close_above_ma60 and today_close < ma60:
         return None
 
     # ── 条件七: 当日下跌或涨幅低于1%（排除跳空大涨/涨停缩量） ──
@@ -1026,178 +1013,8 @@ def scan_stock_d(code, name, price, args):
     }
 
 
-# ═══════════════════════════════════════════
-#  扫描核心 - 买点X（主力净流入滞涨）
-# ═══════════════════════════════════════════
-
-def scan_stock_x(code, name, price, args):
-    """买点X: 净特大>净大单>0，涨幅2%~5%，换手率>5%，量比>1.3
-
-    逻辑:
-    1. 资金面: 净特大 > 净大单 > 0 (NeoData验证)
-    2. 涨幅: 基于前收盘，2%~5%（滞涨特征）
-    3. 量能: 当日量/5日均量 > 1.3（量比>1.3）
-    """
-    if args.min_cap > 0:
-        cap = get_market_cap(code)
-        if cap < args.min_cap:
-            return None
-
-    # ── 获取K线历史(用于量能对比和涨幅) ──
-    kline = get_kline(code, 30)
-    if not kline or len(kline) < 2:
-        return None
-
-    # ── 判断盘中/盘后 ──
-    now = datetime.now()
-    cur_min = now.hour * 60 + now.minute
-    market_open = 9 * 60 + 15
-    market_close = 15 * 60
-    is_intraday = now.weekday() < 5 and market_open <= cur_min <= market_close
-
-    if is_intraday:
-        rt = get_realtime_tencent(code)
-        if not rt:
-            return None
-        today_close = rt['price']
-        prev_close = rt['prev_close']
-        today_vol_raw = rt['vol']
-        passed_w = _calc_passed_weight()
-        today_vol_est = today_vol_raw / passed_w if passed_w >= 0.05 else today_vol_raw
-        vol_actual = today_vol_est
-    else:
-        today = kline[-1]
-        today_close = today['close']
-        prev_close = kline[-2]['close']
-        vol_actual = today['volume']
-
-    # ── 条件2: 涨幅在2%~5%之间 (滞涨但已有启动信号) ──
-    gain_pct = (today_close - prev_close) / prev_close * 100
-    if gain_pct > 5.0 or gain_pct < 2.0:
-        return None
-
-    # ── 条件3: 换手率 > 5%（盘中自动估算）──
-    turnover_rate = get_turnover_rate(code)
-    if turnover_rate <= 0 or turnover_rate <= 5.0:
-        return None
-
-    # ── 条件4: 量比 > 1.3（当日量/5日均量）──
-    recent_5_vol = [k['volume'] for k in kline[-6:-1] if k['volume'] > 0]
-    if len(recent_5_vol) < 3:
-        return None
-    avg_5_vol = sum(recent_5_vol) / len(recent_5_vol)
-    vol_ratio = vol_actual / avg_5_vol
-    if vol_ratio <= 1.3:
-        return None
-
-    # ── 条件1: 资金面（净特大 > 净大单 > 0，NeoData验证）──
-    super_big, big = _check_super_greater_than_big(code)
-    if super_big is None or big <= 0:
-        return None
-    ratio = super_big / big
-
-    # 回测结论：比值1~1.5属自然波动(胜率25%)，>3属追高买入(胜率17.2%)
-    # 甜区1.5~3胜率52.2%,均值+3.14%
-    if ratio < args.x_ratio_min or ratio > args.x_ratio_max:
-        return None
-
-    main_net_val = (super_big + big) / 10000  # NeoData字段为元，转万元
-    main_net_label = f"{main_net_val:.0f}"
-
-    # ── 涨幅标签 ──
-    if gain_pct >= 0:
-        gain_label = f"+{gain_pct:.2f}%"
-    else:
-        gain_label = f"{gain_pct:.2f}%"
-
-    return {
-        '代码': code,
-        '名称': name,
-        '模式': '买点X✅',
-        '涨幅%': gain_label,
-        '量比': f"{vol_ratio:.2f}",
-        '主力净(万)': main_net_label,
-        '净特大': f"{super_big/10000:.0f}",
-        '净大单': f"{big/10000:.0f}",
-        '比值': f"{ratio:.2f}",
-        '价': today_close,
-    }
-
-
-def _check_super_greater_than_big(code):
-    """通过NeoData查询该股**当天**超大单净流入 > 大单净流入 > 0
-
-    盘中模式优先解析「今日资金流向」类型（实时数据），
-    盘后/历史数据回退到「历史资金流向」表的最新一行。
-
-    返回: (super_big, big) 数值（元），或 (None, None) 不满足条件
-    """
-    try:
-        import requests as _req
-        import re
-        std_code = code.replace('sh', '').replace('sz', '').replace('bj', '').zfill(6)
-        query_text = f'{std_code}资金流向超大单大单'
-        payload = {
-            'channel': 'neodata',
-            'sub_channel': 'qclaw',
-            'query': query_text,
-            'request_id': uuid.uuid4().hex,
-            'data_type': 'api',
-            'se_params': {},
-            'extra_params': {},
-        }
-        proxy_port = os.getenv('AUTH_GATEWAY_PORT', '19000')
-        r = _req.post(
-            f'http://localhost:{proxy_port}/proxy/api',
-            headers={
-                'Content-Type': 'application/json',
-                'Remote-URL': 'https://jprx.m.qq.com/aizone/skillserver/v1/proxy/teamrouter_neodata/query',
-            },
-            json=payload,
-            timeout=8,
-        )
-        data = r.json()
-        recalls = data.get('data', {}).get('apiData', {}).get('apiRecall', [])
-
-        # ── 优先：今日资金流向（盘中实时，含今日超大单/大单净流入）──
-        for recall in recalls:
-            if recall.get('type') == '今日资金流向':
-                text = recall['content']
-                # 格式: "超大单流入29249906元，大单流入24576669元"
-                # 此处「流入」实际为净流入值（小单流入可为负）
-                m_super = re.search(r'超大单流入(-?[\d,]+\.?\d*)元', text)
-                # ⚠️ 负向lookbehind防止匹配到「超大单流入」中的「大单」
-                m_big = re.search(r'(?<!超)大单流入(-?[\d,]+\.?\d*)元', text)
-                if m_super and m_big:
-                    super_big = float(m_super.group(1).replace(',', ''))
-                    big = float(m_big.group(1).replace(',', ''))
-                    if super_big > big and big > 0:
-                        return (super_big, big)
-
-        # ── 回退：历史资金流向表 ──
-        for recall in recalls:
-            if recall.get('type') == '历史资金流向':
-                lines = recall['content'].split('\n')
-                for line in lines:
-                    cols = [c.strip() for c in line.split('|')]
-                    if len(cols) >= 14 and len(cols[1]) == 8 and cols[1].isdigit():
-                        try:
-                            super_big = float(cols[12].replace(',', ''))
-                            big = float(cols[13].replace(',', ''))
-                            if super_big > big and big > 0:
-                                return (super_big, big)
-                            return (None, None)
-                        except ValueError:
-                            pass
-        return (None, None)
-    except Exception:
-        return (None, None)
-
-
 def scan_stock(code, name, price, args):
     """根据scan_mode分流"""
-    if args.scan_mode == 'X':
-        return scan_stock_x(code, name, price, args)
     if args.scan_mode == 'D':
         return scan_stock_d(code, name, price, args)
     if args.scan_mode == 'C':
@@ -1276,19 +1093,16 @@ def write_feishu(hits, near, args):
         print('  (无标的，跳过飞书写入)')
         return
     sample = (hits + near)
-    # 检测模式
-    is_x = len(sample) > 0 and sample[0].get('主力净(万)') is not None
-    is_c = not is_x and len(sample) > 0 and sample[0].get('回撤%') is not None
-    is_d = not is_x and len(sample) > 0 and sample[0].get('量/20高') is not None
-    is_b = not is_x and len(sample) > 0 and sample[0].get('缩量日') is not None
-    if is_x:
-        headers = ['代码', '名称', '涨幅%', '量比', '主力净(万)', '净特大', '净大单', '比值', '现价', '状态']
-    elif is_c:
+    # 检测模式：买点C(回撤%) 或 买点D(反弹幅) 或 买点B(MA20距离) 或 买点A
+    is_c = len(sample) > 0 and sample[0].get('回撤%') is not None
+    is_d = len(sample) > 0 and sample[0].get('量/20高') is not None
+    is_b = len(sample) > 0 and sample[0].get('缩量日') is not None
+    if is_c:
         headers = ['代码', '名称', '突破日', '涨幅%', '回调天数', '缩量比', 'K线%', '现价', '回撤%', '状态']
     elif is_d:
         headers = ['代码', '名称', '量/20高', '量/5', 'K线', '回撤%', '收盘', '20日高', 'MA20', '方向']
     elif is_b:
-        headers = ['代码', '名称', '今涨%', '放量比', '缩量日', '缩量比', '缩距', '放量日', '现价', 'K线%', '不满足', '状态']
+        headers = ['代码', '名称', '今涨%', '放量比', '缩量日', '缩量比', '缩距', '放量日', '现价', 'K线%', '状态']
     else:
         headers = ['代码', '名称', '突破日', '涨幅%', '回调天数', '缩量比', 'K线%', '现价', '状态']
     sheet_token = args.feishu_sheet
@@ -1323,9 +1137,7 @@ def write_feishu(hits, near, args):
         return code[2:] if code.startswith(('sh', 'sz')) else code
 
     rows = [headers]
-    if is_x:
-        extra_cols = ['净特大', '净大单']
-    elif is_d:
+    if is_d:
         extra_cols = ['量/20高', '量/5均', 'MA20', 'MA55']
     elif is_b:
         extra_cols = ['今涨%', '放量比', '缩量日', '缩量比', '缩距', '放量日']
@@ -1333,21 +1145,12 @@ def write_feishu(hits, near, args):
         extra_cols = ['回撤%'] if is_c else []
 
     def build_row(r, status_label):
-        if is_x:
-            row = [clean(r['代码']), r['名称'],
-                   r['涨幅%'], r['量比'],
-                   r['主力净(万)'],
-                   r['净特大'], r['净大单'],
-                   f"{r['价']:.2f}", '触发']
-        elif is_b:
-            not_satisfied = ''
-            if status_label == '即将触发' and r.get('不满足'):
-                not_satisfied = r['不满足']
+        if is_b:
             row = [clean(r['代码']), r['名称'],
                    r['今涨%'].replace('%', ''), r['放量比'],
                    r['缩量日'], r['缩量比'], r['缩距'].replace('天', ''),
                    r['放量日'], f"{r['价']:.2f}", r['K线'].replace('%', ''),
-                   not_satisfied, status_label]
+                   status_label]
         elif is_d:
             row = [clean(r['代码']), r['名称'],
                    r['量/20高'],
@@ -1392,21 +1195,14 @@ def write_feishu(hits, near, args):
 def print_table(items, label):
     if not items:
         return
-    is_x = items[0].get('主力净(万)') is not None
-    is_b = not is_x and items[0].get('缩量日') is not None
-    is_c = not is_x and items[0].get('回撤%') is not None
-    is_d = not is_x and items[0].get('量/20高') is not None
-    if is_x:
-        print(f"\n  {'代码':>7} {'名称':<6} {'涨幅%':<7} {'量比':<6} {'主力净(万)':<10} {'净特大':<10} {'净大单':<10} {'现价':<7}")
-        print(f"  {'─'*60}")
-        for r in sorted(items, key=lambda x: float(x['量比'].rstrip('x').rstrip('倍')) if 'x' in x['量比'] or '倍' in x['量比'] else float(x['量比']), reverse=True):
-            print(f"  {r['代码']:>7} {r['名称']:<6} {r['涨幅%']:<7} {r['量比']:<6} {r['主力净(万)']:<10} {r['净特大']:<10} {r['净大单']:<10} {r['价']:<7.2f}")
-    elif is_b:
-        print(f"\n  {'代码':>7} {'名称':<6} {'今涨%':<5} {'放量比':<6} {'缩量日':<6} {'缩量比':<5} {'缩距':<4} {'放量日':<6} {'现价':<7} {'K线%':<5} {'不满足':<7}")
-        print(f"  {'─'*70}")
+    is_b = items[0].get('缩量日') is not None
+    is_c = items[0].get('回撤%') is not None
+    is_d = items[0].get('量/20高') is not None
+    if is_b:
+        print(f"\n  {'代码':>7} {'名称':<6} {'今涨%':<5} {'放量比':<6} {'缩量日':<6} {'缩量比':<5} {'缩距':<4} {'放量日':<6} {'现价':<7} {'K线%':<5}")
+        print(f"  {'─'*61}")
         for r in sorted(items, key=lambda x: x['缩距'], reverse=True):
-            fail_info = r.get('不满足', '')
-            print(f"  {r['代码']:>7} {r['名称']:<6} {r['今涨%']:<5} {r['放量比']:<6} {r['缩量日']:<6} {r['缩量比']:<5} {r['缩距']:<4} {r['放量日']:<6} {r['价']:<7.2f} {r['K线']:<5} {fail_info:<7}")
+            print(f"  {r['代码']:>7} {r['名称']:<6} {r['今涨%']:<5} {r['放量比']:<6} {r['缩量日']:<6} {r['缩量比']:<5} {r['缩距']:<4} {r['放量日']:<6} {r['价']:<7.2f} {r['K线']:<5}")
     elif is_c:
         print(f"\n  {'代码':>7} {'名称':<7} {'突破日':<6} {'涨幅':<6} {'回调':<4} {'缩量比':<5} {'K线':<5} {'现价':<7} {'回撤':<5} {'方向'}")
         print(f"  {'─'*57}")
@@ -1438,8 +1234,7 @@ def main():
     is_c = args.scan_mode == 'C'
     is_b = args.scan_mode == 'B'
     is_d = args.scan_mode == 'D'
-    is_x = args.scan_mode == 'X'
-    mode_name = {'A': '买点A', 'B': '买点B', 'C': '买点C', 'D': '买点D(卖压衰竭)', 'X': '买点X(净特大>净大单>0 滞涨)'}[args.scan_mode]
+    mode_name = {'A': '买点A', 'B': '买点B', 'C': '买点C', 'D': '买点D(卖压衰竭)'}[args.scan_mode]
 
     print("═" * 52)
     print(f"  {mode_name}扫描器 | {datetime.now().strftime('%m-%d %H:%M')}")
@@ -1463,8 +1258,8 @@ def main():
             try:
                 r = f.result()
                 if r:
-                    if is_d or is_x:
-                        # 买点D/X 暂不分触发/即将触发
+                    if is_d:
+                        # 买点D暂不分触发/即将触发
                         hits.append(r)
                     else:
                         mode_check = r['模式']
@@ -1477,23 +1272,14 @@ def main():
 
     print(f"\n扫描完成: {time.time() - t_start:.0f}s")
     print(f"\n{'─'*52}")
-    print(f"  ✅ {mode_name}触发: {len(hits)} 只")
-    if not is_d and not is_x:
+    print(f"  ✅ {mode_name}触发: {len(hits)} 只（今日可买入）")
+    if not is_d:
         print(f"  ⏳ 即将触发: {len(near)} 只（观察1-2天）")
     print(f"{'─'*52}")
 
     print_table(hits, '触发')
     if hits:
-        if is_x:
-            print(f"\n  → 买点X是主力净流入滞涨预警")
-            print(f"  → 主力净流入>0说明有资金在吸筹")
-            print(f"  → 涨幅2%~5%，已有启动信号但没高潮")
-            print(f"  → 换手率>5%，交投活跃")
-            print(f"  → 净特大>净大单，机构主导")
-            print(f"  → 量能提升说明已经有资金在动")
-            print(f"  → 策略: 盘中可追，止损跌破今日低点-3%")
-            print(f"  ⚠ 数据源: 腾讯gtimg(主力净)，NeoData(净特大/净大单)")
-        elif is_d:
+        if is_d:
             print(f"\n  → 买点D是卖压衰竭预警（非买入信号）")
             print(f"  → 策略: 信号出现后2-5天内博弈反弹，尾盘搞")
             print(f"  → 止损: 信号日最低-3%")
@@ -1507,7 +1293,7 @@ def main():
             print(f"  → 反包日确认: 阳线收盘超前高+量≥缩量日×1.3+MACD改善+站上5日线")
         else:
             print(f"\n  → 尾盘买入50% | 止损=突破日阳线实体最低-3%")
-    if near and not is_d and not is_x:
+    if near and not is_d:
         print_table(near, '即将触发')
         if is_c:
             print(f"\n  → 加自选，等缩量+小K线+不破20日线再确认")
