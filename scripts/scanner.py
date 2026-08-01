@@ -553,27 +553,29 @@ def scan_stock_b(code, name, price, args):
     # 实际涨幅（基于前收盘，非开盘价）
     gain_today = (today_close - yesterday_close) / yesterday_close * 100
 
-    # 收集阶段三失败项（近缩量票不封死，记入不满足项）
-    phase3_fails = []
-
     # 阳线（收盘 > 前收盘即视为上涨）
     if today_close <= yesterday_close:
-        phase3_fails.append('非阳线')
+        return None
 
     # 双因子反包：收盘≥前日最高，或(今高≥前日最高 AND 今收>昨开=阳吃阴)
     if not (today_close >= yesterday['high'] or (today_high >= yesterday['high'] and today_close > yesterday['open'])):
-        phase3_fails.append('未反包')
+        return None
 
     # 放量检测：今日量 ≥ 缩量日量 × 阈值（盘中用预估量）
     # 缺口替补：量不足但真实缺口同样认可（缺口=买方紧迫性，幅度不限）
     if today_vol < shrink_day['volume'] * args.e_reversal_vol_ratio:
         real_gap = today_low > yesterday['high']
         if not real_gap:
-            phase3_fails.append('放量不足')
+            return None
 
     # MACD双因子：柱翻转(柱>前日) 或 DIF>DEA(柱>0，多头趋势未破坏)
     if len(macd) >= 2 and not (macd[-1] > macd[-2] or macd[-1] > 0):
-        phase3_fails.append('MACD')
+        return None
+
+    # 站上5日线（不再作为必要条件，仅观察参考）
+    # ma5 = sum(k['close'] for k in kline[-5:]) / 5
+    # if today_close < ma5:
+    #     return None
 
     # 反包日量 > 10日均量 × 0.8（盘中用预估量）
     # 缺口替补：量不足但真实缺口同样通过
@@ -581,21 +583,16 @@ def scan_stock_b(code, name, price, args):
     if today_vol < avg_10d_vol * 0.8:
         real_gap = today_low > yesterday['high']
         if not real_gap:
-            phase3_fails.append('均量不足')
+            return None
 
     # 缩量日距今不超过2天（洗盘-反包间隔不宜过长）
     if n - 1 - shrink_day_idx > 2:
-        phase3_fails.append('缩距过长')
+        return None
 
     # ── 过滤：当日最高不创10日新高（卖压衰竭特征，非强势突破） ──
     max_high_10d_back = max(k['high'] for k in kline[-11:-1])  # 不含今日的近10天
     if today_high > max_high_10d_back:
-        phase3_fails.append('创新高')
-
-    # 非近缩量票：阶段三有任一失败即淘汰
-    if not near_miss_shrink and phase3_fails:
         return None
-    # 近缩量票：阶段三可以失败，记入不满足项继续输出
 
     # ── 三项检查: 资金净流入 / 量>前5日均量 / 换手率>10% ──
     # 均净流出→淘汰；任一不满足→即将触发⏳；全满足→买点B✅
@@ -605,12 +602,8 @@ def scan_stock_b(code, name, price, args):
     if money_flow is not None:
         big_net, super_big_net = money_flow
         if big_net <= 0 and super_big_net <= 0:
-            if not near_miss_shrink:
-                return None  # 非近缩量票：均净流出淘汰
-            phase3_fails.append('资金双流')  # 近缩量票：记入不满足
-            fund_ok = False
-        else:
-            fund_ok = big_net > 0 and super_big_net > 0
+            return None  # 均净流出，淘汰
+        fund_ok = big_net > 0 and super_big_net > 0
     else:
         fund_ok = True  # 接口超时放行
 
@@ -625,11 +618,10 @@ def scan_stock_b(code, name, price, args):
     else:
         turnover_ok = True  # 接口超时放行
 
-    # 收集不满足项
+    # 收集不满足项（仅对实际执行了检查的条件计数）
     fail_reasons = []
     if near_miss_shrink:
         fail_reasons.append('缩量比偏大')
-    fail_reasons.extend(phase3_fails)
     if money_flow is not None and not fund_ok:
         fail_reasons.append('资金')
     if not vol_ok:
@@ -639,7 +631,7 @@ def scan_stock_b(code, name, price, args):
 
     if near_miss_shrink:
         mode_tag = '即将触发⏳'  # 缩量比接近阈值，归入触发列表
-    elif not phase3_fails and fund_ok and vol_ok and turnover_ok:
+    elif fund_ok and vol_ok:
         mode_tag = '买点B✅'
     else:
         mode_tag = '即将触发⏳'
@@ -1091,7 +1083,7 @@ def scan_stock_x(code, name, price, args):
         return None
 
     # ── 条件1: 资金面（净特大 > 净大单 > 0，NeoData验证）──
-    super_big, big = _check_super_greater_than_big(code)
+    super_big, big, source_label = _check_super_greater_than_big(code)
     if super_big is None or big <= 0:
         return None
     ratio = super_big / big
@@ -1120,6 +1112,7 @@ def scan_stock_x(code, name, price, args):
         '净特大': f"{super_big/10000:.0f}",
         '净大单': f"{big/10000:.0f}",
         '比值': f"{ratio:.2f}",
+        '数据源': source_label,
         '价': today_close,
     }
 
@@ -1128,13 +1121,15 @@ def _check_super_greater_than_big(code):
     """通过NeoData查询该股**当天**超大单净流入 > 大单净流入 > 0
 
     盘中模式优先解析「今日资金流向」类型（实时数据），
-    盘后/历史数据回退到「历史资金流向」表的最新一行。
+    盘后/历史数据回退到「历史资金流向」表的最新一行（必须为当天日期）。
 
-    返回: (super_big, big) 数值（元），或 (None, None) 不满足条件
+    返回: (super_big, big, source_label) 数值（元）+ 数据来源标签
+    其中 source_label = '今日' | '历史-今天' | '失败-xxx'
     """
     try:
         import requests as _req
         import re
+        today_str = datetime.now().strftime('%Y%m%d')
         std_code = code.replace('sh', '').replace('sz', '').replace('bj', '').zfill(6)
         query_text = f'{std_code}资金流向超大单大单'
         payload = {
@@ -1172,26 +1167,35 @@ def _check_super_greater_than_big(code):
                     super_big = float(m_super.group(1).replace(',', ''))
                     big = float(m_big.group(1).replace(',', ''))
                     if super_big > big and big > 0:
-                        return (super_big, big)
+                        return (super_big, big, '今日')
 
-        # ── 回退：历史资金流向表 ──
+        # ── 回退：历史资金流向表（⚠️ 仅接受当天日期的行）──
         for recall in recalls:
             if recall.get('type') == '历史资金流向':
                 lines = recall['content'].split('\n')
                 for line in lines:
                     cols = [c.strip() for c in line.split('|')]
+                    # cols[1] = 日期(YYYYMMDD)
                     if len(cols) >= 14 and len(cols[1]) == 8 and cols[1].isdigit():
+                        # 🚨 日期守卫：不是今天的数据直接跳过
+                        if cols[1] != today_str:
+                            continue
                         try:
                             super_big = float(cols[12].replace(',', ''))
                             big = float(cols[13].replace(',', ''))
                             if super_big > big and big > 0:
-                                return (super_big, big)
-                            return (None, None)
+                                return (super_big, big, '历史-今天')
+                            return (None, None, '历史-条件不符')
                         except ValueError:
                             pass
-        return (None, None)
-    except Exception:
-        return (None, None)
+                # 历史表有数据但没有今天这一行 → 没拿到今日数据
+                return (None, None, '历史-无今日数据')
+        # 今日和历史都没拿到
+        return (None, None, '失败-无数据')
+    except Exception as e:
+        print(f"  [NeoData失败] {code}: {type(e).__name__}")
+        return (None, None, '失败-' + type(e).__name__)
+
 
 
 def scan_stock(code, name, price, args):
@@ -1282,7 +1286,7 @@ def write_feishu(hits, near, args):
     is_d = not is_x and len(sample) > 0 and sample[0].get('量/20高') is not None
     is_b = not is_x and len(sample) > 0 and sample[0].get('缩量日') is not None
     if is_x:
-        headers = ['代码', '名称', '涨幅%', '量比', '主力净(万)', '净特大', '净大单', '比值', '现价', '状态']
+        headers = ['代码', '名称', '涨幅%', '量比', '主力净(万)', '净特大', '净大单', '比值', '数据源', '现价', '状态']
     elif is_c:
         headers = ['代码', '名称', '突破日', '涨幅%', '回调天数', '缩量比', 'K线%', '现价', '回撤%', '状态']
     elif is_d:
@@ -1338,11 +1342,10 @@ def write_feishu(hits, near, args):
                    r['涨幅%'], r['量比'],
                    r['主力净(万)'],
                    r['净特大'], r['净大单'],
+                   r.get('数据源', '-'),
                    f"{r['价']:.2f}", '触发']
         elif is_b:
-            not_satisfied = ''
-            if status_label == '即将触发' and r.get('不满足'):
-                not_satisfied = r['不满足']
+            not_satisfied = r.get('不满足', '')
             row = [clean(r['代码']), r['名称'],
                    r['今涨%'].replace('%', ''), r['放量比'],
                    r['缩量日'], r['缩量比'], r['缩距'].replace('天', ''),
@@ -1364,15 +1367,23 @@ def write_feishu(hits, near, args):
             row.append(status_label)
         return row
 
-    for r_ in hits:
+    # 飞书写入也按放量比降序
+    hits_sorted = sorted(hits, key=lambda x: float(x.get('放量比', 0)), reverse=True) if is_b else hits
+    near_sorted = sorted(near, key=lambda x: float(x.get('放量比', 0)), reverse=True) if is_b else near
+
+    for r_ in hits_sorted:
         rows.append(build_row(r_, '触发'))
     sep = [''] * (len(headers) - 1) + ['--- 即将触发 ---']
     rows.append(sep)
     rows.append(headers)
-    for r_ in near:
+    for r_ in near_sorted:
         rows.append(build_row(r_, '即将触发'))
 
     cols = len(headers)
+    # 补空行到200行，覆盖掉底部残留旧数据
+    empty_row = [''] * cols
+    while len(rows) < 200:
+        rows.append(empty_row[:])
     range_str = f"{new_sheet_id}!A1:{chr(64 + cols)}{len(rows)}"
     r2 = requests.put(
         f'https://open.feishu.cn/open-apis/sheets/v2/spreadsheets/{sheet_token}/values',
@@ -1404,7 +1415,7 @@ def print_table(items, label):
     elif is_b:
         print(f"\n  {'代码':>7} {'名称':<6} {'今涨%':<5} {'放量比':<6} {'缩量日':<6} {'缩量比':<5} {'缩距':<4} {'放量日':<6} {'现价':<7} {'K线%':<5} {'不满足':<7}")
         print(f"  {'─'*70}")
-        for r in sorted(items, key=lambda x: x['缩距'], reverse=True):
+        for r in sorted(items, key=lambda x: float(x['放量比']), reverse=True):
             fail_info = r.get('不满足', '')
             print(f"  {r['代码']:>7} {r['名称']:<6} {r['今涨%']:<5} {r['放量比']:<6} {r['缩量日']:<6} {r['缩量比']:<5} {r['缩距']:<4} {r['放量日']:<6} {r['价']:<7.2f} {r['K线']:<5} {fail_info:<7}")
     elif is_c:

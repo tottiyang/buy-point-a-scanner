@@ -1,6 +1,7 @@
 #!/bin/bash
-# 买点X 盘中扫描 cron wrapper
-# 仅在交易日 9:40-15:00 运行
+#!/bin/bash
+# 买点X 盘中扫描 cron wrapper (上午盘)
+# 交易日 9:35-11:30，每10分钟运行
 
 TZ=Asia/Shanghai date
 
@@ -12,8 +13,8 @@ if [ "$DOW" -ge 6 ]; then
 fi
 
 NOW=$(TZ=Asia/Shanghai date +%H%M)
-if [ "$NOW" -lt 0940 ] || [ "$NOW" -ge 1500 ]; then
-    echo "非交易时段（$NOW），跳过"
+if [ "$NOW" -lt 0935 ] || [ "$NOW" -ge 1130 ]; then
+    echo "非交易时段($NOW)，跳过"
     exit 0
 fi
 
